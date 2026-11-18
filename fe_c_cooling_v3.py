@@ -298,6 +298,11 @@ def _grain_edges(g):
     edge[:, :-1] |= g[:, :-1] != g[:, 1:]
     return edge
 
+# Phase that grows from grain boundaries when two solid phases coexist.
+# The first entry present in a region is the boundary phase. This is set by
+# identity, not by fraction, so the colors do not swap when fractions cross 50%.
+BOUNDARY_PRIORITY = ["cementite", "ferrite", "austenite", "pearlite"]
+
 
 def micro_image(micro, size=200, n=18, seed=7):
     """Draw a schematic micrograph inside a circle.
@@ -307,8 +312,9 @@ def micro_image(micro, size=200, n=18, seed=7):
         2. Liquid + austenite: austenite nucleates at each grain center and
            grows outward into the liquid. Pixels nearest a center transform
            first. Boundaries are drawn only inside the solid.
-        3. Solid phases: the minority phase sits on grain boundaries first
-           and grows inward. Pearlite gets stripes at each grain's angle.
+        3. Solid phases: the boundary phase (set by BOUNDARY_PRIORITY) sits on
+           grain boundaries first and grows inward. Its area fraction equals
+           its lever-rule fraction. Pearlite gets stripes at each grain's angle.
 
     Args:
         micro: list of (name, fraction) pairs, fractions summing to about 1.
@@ -375,29 +381,37 @@ def micro_image(micro, size=200, n=18, seed=7):
         img[~inside] = 1.0
         return img
 
-    # --- Case 3: solid two-phase, growth from grain boundaries -------------
+    # --- Case 3: solid phases, boundary-first growth ------------------------
+    # Only one phase present: paint the whole circle and draw the grain lines.
+    if len(micro) == 1:
+        paint(inside, micro[0][0])
+        img[_grain_edges(g) & inside] = (0.2, 0.2, 0.2)
+        img[~inside] = 1.0
+        return img
+
+    # Pick the boundary phase by priority, not by fraction. The other phase
+    # becomes the matrix that fills the grain interiors.
+    boundary_name = next(p for p in BOUNDARY_PRIORITY if p in fractions)
+    matrix_name = next(name for name, _ in micro if name != boundary_name)
+    f_boundary = fractions[boundary_name]
+
     # Gap is near zero on grain boundaries and large inside grains.
     two_nearest = np.sqrt(np.partition(d, 1, axis=-1)[..., :2])
     gap = two_nearest.max(axis=-1) - two_nearest.min(axis=-1)
 
-    # The majority phase fills the circle. The minority phase takes the
-    # pixels with the smallest gaps, so it sits on grain boundaries first.
-    ordered = sorted(micro, key=lambda item: item[1], reverse=True)
-    maj_name, _ = ordered[0]
-
-    is_minor = np.zeros((size, size), dtype=bool)
-    if len(ordered) > 1:
-        min_name, min_frac = ordered[-1]
+    # The boundary phase takes the pixels with the smallest gaps, so it sits
+    # on the grain boundaries first and grows inward.
+    is_boundary = np.zeros((size, size), dtype=bool)
+    if f_boundary > 0.0:
         inside_idx = np.flatnonzero(inside)
-        k = int(round(min_frac * inside_idx.size))
+        k = int(round(f_boundary * inside_idx.size))
         if k > 0:
             order = np.argsort(gap.ravel()[inside_idx])
             chosen = inside_idx[order[:k]]
-            is_minor.flat[chosen] = True
+            is_boundary.flat[chosen] = True
 
-    paint(inside & ~is_minor, maj_name)
-    if len(ordered) > 1 and is_minor.any():
-        paint(inside & is_minor, ordered[-1][0])
+    paint(inside & ~is_boundary, matrix_name)
+    paint(inside & is_boundary, boundary_name)
 
     # Grain boundaries across the whole solid circle.
     img[_grain_edges(g) & inside] = (0.2, 0.2, 0.2)
