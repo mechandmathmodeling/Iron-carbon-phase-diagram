@@ -34,7 +34,8 @@ from matplotlib.patches import Circle, Rectangle  # noqa: E402
 import streamlit as st  # noqa: E402
 
 # Must be the first Streamlit command in the script.
-st.set_page_config(page_title="Fe-C cooling explorer", layout="wide")
+st.set_page_config(page_title="Fe-C cooling explorer", layout="wide",
+                  initial_sidebar_state="expanded")
 
 
 # ---------------------------------------------------------------------------
