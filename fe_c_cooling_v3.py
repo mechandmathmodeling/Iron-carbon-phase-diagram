@@ -10,33 +10,51 @@ tracks an alloy as it cools. Three panels update together:
     3. A lever-rule seesaw. Each phase is a circle whose AREA is proportional
        to its mass fraction, sitting on a beam balanced at the alloy C0.
 
-The micrograph and seesaw share one figure, so their combined height equals
-the height of the phase diagram.
+The micrograph and seesaw share one right-hand figure so their combined height
+equals the height of the phase diagram. Both panels are built as lightweight
+inline SVGs (with the micrograph embedded as a small PNG whose Voronoi grain
+geometry is precomputed once), avoiding heavy plotting libraries so the app
+loads quickly and uses minimal memory.
 
-Run with:  streamlit run fe_c_cooling.py
+Run with:  streamlit run fe_c_cooling_v3.py
 
 Note: the boundary curves are hand-placed approximations, traced by eye from
 a reference diagram. They are not digitized data.
 """
 
+import base64
+import html
+import struct
 import time
-from io import BytesIO
+import zlib
 from pathlib import Path
 
 import numpy as np
-import matplotlib
-
-# "Agg" is a non-interactive backend. Streamlit renders figures to images,
-# so no GUI window is needed. This must be set before importing pyplot.
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.patches import Circle, Rectangle  # noqa: E402
-import streamlit as st  # noqa: E402
+import streamlit as st
 
 # Must be the first Streamlit command in the script.
-st.set_page_config(page_title="Fe-C cooling explorer", layout="wide",
-                  initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="Fe-C cooling explorer",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
+# Adjust the vertical padding of the main Streamlit container
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 1.2rem;
+        padding-bottom: 0.5rem;
+    }
+    /* Optional: tighten vertical gaps between widgets */
+    [data-testid="stVerticalBlock"] > div {
+        gap: 0.4rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ---------------------------------------------------------------------------
 # Physical constants (all temperatures in °C, compositions in wt% C)
@@ -49,16 +67,39 @@ C_ECT = 4.30            # eutectic composition
 C_FERRITE_MAX = 0.022   # max carbon in ferrite, reached at 727 °C
 C_CEM = 6.67            # carbon in cementite (Fe3C), a fixed compound
 
+
 # ---------------------------------------------------------------------------
-# Figure layout, in inches. Images are shown at DPI pixels per inch.
+# SVG canvas geometry and font sizes (all units in SVG pixels)
+# Both panels share HEIGHT = 500 so they align to the same height on screen.
 # ---------------------------------------------------------------------------
-DPI = 100
-DIAG_W, DIAG_H = 6.2, 5.0            # phase diagram panel (larger)
-RIGHT_W = 3.4                        # width of the micrograph + seesaw panel
-MICRO_D = 1.07                       # micrograph diameter
-TITLE_H = 0.30                       # room above the micrograph for its title
-SEE_H = DIAG_H - MICRO_D - TITLE_H   # seesaw height, so the stack matches
-                                     # the diagram's height exactly
+HEIGHT = 500
+DIAG_W = 620            # phase diagram panel (wider)
+RIGHT_W = 380           # micrograph + legend + seesaw panel
+
+# Plot area margins inside the phase diagram SVG
+PAD_L, PAD_R, PAD_T, PAD_B = 72, 20, 42, 58
+PLOT_W = DIAG_W - PAD_L - PAD_R
+PLOT_H = HEIGHT - PAD_T - PAD_B
+
+# Micrograph circle and seesaw layout inside the right-hand SVG
+MICRO_CX, MICRO_CY, MICRO_R = 252, 108, 66   # circle center and radius
+SEESAW_TOP = 192                             # top of the seesaw region
+BEAM_Y = 365                                 # vertical position of the seesaw beam
+R_MAX = 46                                   # max circle radius (at 100% fraction)
+MAX_ARM_PX = 112                             # max half-span of the seesaw beam
+
+# Typography (change any size here to scale labels across the app)
+FONT_FAMILY = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif"
+FS_TITLE = 18       # panel titles
+FS_AXIS = 15        # axis titles (wt% C, Temperature)
+FS_TICK = 13        # axis tick numbers
+FS_REGION = 15      # phase region labels (L, γ + L, γ, α + Fe₃C)
+FS_TEMP_REF = 13    # critical temperature & Fe3C callouts
+FS_TIE = 14         # tie-line endpoint labels
+FS_LEGEND = 15      # micrograph color key labels
+FS_SEESAW = 15      # seesaw phase name & percentage labels
+FS_ARM = 14         # seesaw arm length labels
+FS_NOTE = 13.5      # seesaw bottom rule reminder
 
 
 # ---------------------------------------------------------------------------
@@ -109,17 +150,22 @@ DISPLAY = {
     "pearlite": "pearlite",
 }
 
-# Standard teaching colors for the micrograph and legend.
-AUSTENITE_RGB = (1.00, 0.85, 0.20)   # yellow
-FERRITE_RGB = (0.35, 0.55, 0.90)     # blue
-CEMENTITE_RGB = (0.05, 0.05, 0.05)   # black
+# Standard teaching colors in 8-bit RGB (0-255) for the micrograph, plus hex
+# strings derived from them for the SVG legend and seesaw circles.
+AUSTENITE_RGB = (255, 217, 51)     # yellow
+FERRITE_RGB = (89, 140, 230)       # blue
+CEMENTITE_RGB = (13, 13, 13)       # black
+LIQUID_RGB = (255, 255, 255)       # white
+EDGE_RGB = (51, 51, 51)            # dark grey grain boundaries
 
 MICRO_COLORS = {
-    "liquid": (1.0, 1.0, 1.0),
+    "liquid": LIQUID_RGB,
     "austenite": AUSTENITE_RGB,
     "ferrite": FERRITE_RGB,
     "cementite": CEMENTITE_RGB,
 }
+PHASE_HEX = {name: f"#{r:02x}{g:02x}{b:02x}" for name, (r, g, b) in MICRO_COLORS.items()}
+
 # Pearlite is drawn as stripes of ferrite (light) and Fe3C (dark).
 PEARL_DARK = CEMENTITE_RGB
 PEARL_LIGHT = FERRITE_RGB
@@ -287,24 +333,60 @@ def state(C, T):
 # Microstructure schematic
 # ---------------------------------------------------------------------------
 
-def _grain_edges(g):
-    """Return a boolean mask of pixels that touch a different grain.
-
-    A pixel is on a boundary if its grain label differs from the pixel
-    below it or to its right.
-    """
-    edge = np.zeros(g.shape, dtype=bool)
-    edge[:-1, :] |= g[:-1, :] != g[1:, :]
-    edge[:, :-1] |= g[:, :-1] != g[:, 1:]
-    return edge
-
 # Phase that grows from grain boundaries when two solid phases coexist.
 # The first entry present in a region is the boundary phase. This is set by
 # identity, not by fraction, so the colors do not swap when fractions cross 50%.
 BOUNDARY_PRIORITY = ["cementite", "ferrite", "austenite", "pearlite"]
 
 
-def micro_image(micro, size=200, n=18, seed=7):
+@st.cache_resource
+def _micro_grid(size=160, n=18, seed=7):
+    """Precompute the static Voronoi grain layout once per app process.
+
+    Because the grain seeds, stripe orientations, and boundary distances never
+    change between temperatures or compositions, caching them in float32 avoids
+    recomputing (size x size x n) distance matrices on every animation frame.
+    """
+    rng = np.random.default_rng(seed)
+    seeds = rng.uniform(-1, 1, (n, 2)).astype(np.float32)
+    angles = rng.uniform(0, np.pi, n).astype(np.float32)
+
+    # Pixel grid covering [-1, 1] x [-1, 1].
+    xs = np.linspace(-1, 1, size, dtype=np.float32)
+    X, Y = np.meshgrid(xs, xs)
+    inside = X ** 2 + Y ** 2 <= 1.0     # pixels inside the circle
+    inside_idx = np.flatnonzero(inside)
+
+    # Squared distance from every pixel to every seed, shape (size, size, n).
+    d = (X[..., None] - seeds[:, 0]) ** 2 + (Y[..., None] - seeds[:, 1]) ** 2
+
+    # g: grain label of each pixel (index of its nearest seed).
+    g = d.argmin(axis=-1)
+
+    # A pixel is on a boundary if its grain label differs from its neighbor
+    # below or to the right.
+    edges = np.zeros(g.shape, dtype=bool)
+    edges[:-1, :] |= g[:-1, :] != g[1:, :]
+    edges[:, :-1] |= g[:, :-1] != g[:, 1:]
+    edges &= inside
+
+    # Stripe pattern for pearlite, using each pixel's own grain angle.
+    stripes = np.sin((X * np.cos(angles[g]) + Y * np.sin(angles[g])) * 40) > 0
+
+    # Distance from each pixel to its own grain center (0 at center, max at edge).
+    d_own = np.sqrt(d.min(axis=-1))
+    d_own_inside = d_own[inside]
+
+    # Gap between the two nearest seeds is near zero on grain boundaries and
+    # large inside grains. Pre-sorting inside pixels lets each frame slice [:k].
+    two_nearest = np.sqrt(np.partition(d, 1, axis=-1)[..., :2])
+    gap = two_nearest.max(axis=-1) - two_nearest.min(axis=-1)
+    gap_order = inside_idx[np.argsort(gap.ravel()[inside_idx])]
+
+    return size, inside, inside_idx, edges, stripes, d_own, d_own_inside, gap_order
+
+
+def micro_image(micro):
     """Draw a schematic micrograph inside a circle.
 
     Three cases:
@@ -318,36 +400,13 @@ def micro_image(micro, size=200, n=18, seed=7):
 
     Args:
         micro: list of (name, fraction) pairs, fractions summing to about 1.
-        size: image resolution in pixels (size x size).
-        n: number of grains (Voronoi seed points).
-        seed: random seed, so the same inputs always give the same picture.
 
     Returns:
-        An RGB float array of shape (size, size, 3) with values in [0, 1].
+        A uint8 RGB array of shape (size, size, 3) with values in [0, 255].
     """
+    size, inside, inside_idx, edges, stripes, d_own, d_own_inside, gap_order = _micro_grid()
     fractions = dict(micro)
-
-    # Grain centers and a stripe angle for each grain.
-    rng = np.random.default_rng(seed)
-    seeds = rng.uniform(-1, 1, (n, 2))
-    angles = rng.uniform(0, np.pi, n)
-
-    # Pixel grid covering [-1, 1] x [-1, 1].
-    xs = np.linspace(-1, 1, size)
-    X, Y = np.meshgrid(xs, xs)
-    inside = X ** 2 + Y ** 2 <= 1.0     # pixels inside the circle
-
-    # Squared distance from every pixel to every seed, shape (size, size, n).
-    d = (X[..., None] - seeds[:, 0]) ** 2 + (Y[..., None] - seeds[:, 1]) ** 2
-
-    # g: grain label of each pixel (index of its nearest seed).
-    g = d.argmin(axis=-1)
-
-    # Stripe pattern for pearlite, using each pixel's own grain angle.
-    stripes = np.sin((X * np.cos(angles[g]) +
-                      Y * np.sin(angles[g])) * 40) > 0
-
-    img = np.ones((size, size, 3))      # start white
+    img = np.full((size, size, 3), 255, dtype=np.uint8)  # start white
 
     def paint(mask, name):
         """Color the pixels in `mask` with the color of phase `name`."""
@@ -363,30 +422,23 @@ def micro_image(micro, size=200, n=18, seed=7):
 
         # Pure liquid: nothing to draw, so the circle stays white.
         if f_aus <= 0.0:
-            img[~inside] = 1.0
             return img
-
-        # Distance from each pixel to its own grain center. It is 0 at the
-        # center and largest at the grain boundary.
-        d_own = np.sqrt(d.min(axis=-1))
 
         # Austenite fills the pixels nearest the centers. The cutoff is the
         # f_aus quantile of d_own over the circle, so the austenite area
         # equals its lever-rule fraction.
-        cutoff = np.quantile(d_own[inside], min(f_aus, 1.0))
+        cutoff = np.quantile(d_own_inside, min(f_aus, 1.0))
         solid = inside & (d_own <= cutoff)
 
         img[solid] = AUSTENITE_RGB
-        img[_grain_edges(g) & solid] = (0.2, 0.2, 0.2)
-        img[~inside] = 1.0
+        img[edges & solid] = EDGE_RGB
         return img
 
     # --- Case 3: solid phases, boundary-first growth ------------------------
     # Only one phase present: paint the whole circle and draw the grain lines.
     if len(micro) == 1:
         paint(inside, micro[0][0])
-        img[_grain_edges(g) & inside] = (0.2, 0.2, 0.2)
-        img[~inside] = 1.0
+        img[edges] = EDGE_RGB
         return img
 
     # Pick the boundary phase by priority, not by fraction. The other phase
@@ -395,39 +447,56 @@ def micro_image(micro, size=200, n=18, seed=7):
     matrix_name = next(name for name, _ in micro if name != boundary_name)
     f_boundary = fractions[boundary_name]
 
-    # Gap is near zero on grain boundaries and large inside grains.
-    two_nearest = np.sqrt(np.partition(d, 1, axis=-1)[..., :2])
-    gap = two_nearest.max(axis=-1) - two_nearest.min(axis=-1)
-
-    # The boundary phase takes the pixels with the smallest gaps, so it sits
-    # on the grain boundaries first and grows inward.
+    # The boundary phase takes the pixels with the smallest boundary gaps, so
+    # it sits on the grain boundaries first and grows inward.
     is_boundary = np.zeros((size, size), dtype=bool)
     if f_boundary > 0.0:
-        inside_idx = np.flatnonzero(inside)
         k = int(round(f_boundary * inside_idx.size))
         if k > 0:
-            order = np.argsort(gap.ravel()[inside_idx])
-            chosen = inside_idx[order[:k]]
-            is_boundary.flat[chosen] = True
+            is_boundary.flat[gap_order[:k]] = True
 
     paint(inside & ~is_boundary, matrix_name)
     paint(inside & is_boundary, boundary_name)
 
     # Grain boundaries across the whole solid circle.
-    img[_grain_edges(g) & inside] = (0.2, 0.2, 0.2)
-    img[~inside] = 1.0
+    img[edges] = EDGE_RGB
     return img
 
+
+def _png_chunk(tag, data):
+    """Build one PNG chunk (4-byte length, 4-byte type, payload, CRC32)."""
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+
+def _rgb_to_png_b64(img):
+    """Encode a uint8 RGB array as a base64 PNG using only the stdlib."""
+    h, w, _ = img.shape
+    raw = np.empty((h, 1 + w * 3), dtype=np.uint8)
+    raw[:, 0] = 0  # PNG filter type 0 (None) at the start of each scanline
+    raw[:, 1:] = img.reshape(h, w * 3)
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    idat = zlib.compress(raw.tobytes(), level=1)
+    png = b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", idat) + _png_chunk(b"IEND", b"")
+    return base64.b64encode(png).decode("ascii")
+
+
+@st.cache_data(max_entries=64)
+def _micro_png_b64(micro_key):
+    """Cache encoded micrograph PNGs for repeated states (e.g. below 727 °C)."""
+    return _rgb_to_png_b64(micro_image(list(micro_key)))
+
+
 # ---------------------------------------------------------------------------
-# Drawing functions
+# Drawing helpers & SVG builders
 # ---------------------------------------------------------------------------
 # Drawing-only stretch near zero composition. The phase logic never uses this.
 DISPLAY_STRETCH = 3.0        # how much the 0 to 0.1 wt% C band is widened
 DISPLAY_STRETCH_MAX = 0.1    # compositions above this are drawn to true scale
+X_MAX = float(6.8 + DISPLAY_STRETCH_MAX * (DISPLAY_STRETCH - 1.0))
 
 
 def xdisp(c):
-    """Map a true wt% C value to an x-position on the plot.
+    """Map a true wt% C value to a stretched composition coordinate.
 
     Compositions up to 0.1 wt% C are multiplied by DISPLAY_STRETCH, so the
     ferrite solvus is visible near the y-axis. Above 0.1 the scale is linear
@@ -441,236 +510,275 @@ def xdisp(c):
                     c * DISPLAY_STRETCH,
                     c + offset)
 
-def draw_diagram(ax, C0, T0, T, s):
-    """Draw the phase diagram, cooling path, and current tie line.
 
-    Every composition is passed through xdisp() before plotting, so the
-    region near 0 wt% C is widened. Temperatures are drawn as-is.
+def _sx_disp(xd):
+    """Convert an already-stretched composition value into an SVG x-coordinate."""
+    return PAD_L + (float(xd) / X_MAX) * PLOT_W
+
+
+def _sx(c):
+    """Convert a true wt% C value into an SVG x-coordinate."""
+    return _sx_disp(xdisp(c))
+
+
+def _sy(t):
+    """Convert a temperature (°C) into an SVG y-coordinate (0 °C at bottom)."""
+    return PAD_T + ((1600.0 - float(t)) / 1600.0) * PLOT_H
+
+
+def _polyline(cs, ts, stroke="#404040", width=1.6, dash=""):
+    """Build an SVG <polyline> from (wt% C, °C) arrays."""
+    pts = " ".join(f"{_sx(c):.1f},{_sy(t):.1f}" for c, t in zip(cs, ts))
+    d_attr = f' stroke-dasharray="{dash}"' if dash else ""
+    return f'<polyline fill="none" stroke="{stroke}" stroke-width="{width}"{d_attr} points="{pts}"/>'
+
+
+def _line(x1, y1, x2, y2, stroke="#404040", width=1.6, dash=""):
+    """Build an SVG <line> between two pixel coordinates."""
+    d_attr = f' stroke-dasharray="{dash}"' if dash else ""
+    return f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="{stroke}" stroke-width="{width}"{d_attr}/>'
+
+
+def _text(x, y, content, size, anchor="middle", fill="#222", weight="normal", halo=False, baseline="auto"):
+    """Build an escaped SVG <text> element, optionally with a white outline halo."""
+    halo_attr = ' stroke="white" stroke-width="3.5" paint-order="stroke" stroke-linejoin="round"' if halo else ""
+    w_attr = f' font-weight="{weight}"' if weight != "normal" else ""
+    b_attr = f' dominant-baseline="{baseline}"' if baseline != "auto" else ""
+    return (
+        f'<text x="{x:.1f}" y="{y:.1f}" font-size="{size}" fill="{fill}" '
+        f'text-anchor="{anchor}"{w_attr}{b_attr}{halo_attr}>{html.escape(content)}</text>'
+    )
+
+
+@st.cache_data(max_entries=1)
+def _static_diagram_body():
+    """Build the unchanging background SVG elements of the Fe-C diagram once.
+
+    Grid lines, axes, boundary curves, and reference labels never move during
+    an animation, so caching them lets each frame render only the cooling line,
+    tie line, current dot, and temperature title.
+    """
+    el = []
+
+    # --- Axes, grid, and ticks (show true wt% C at stretched positions) ---
+    for t in range(0, 1601, 200):
+        y = _sy(t)
+        el.append(_line(PAD_L, y, PAD_L + PLOT_W, y, stroke="#e6e6e6", width=1.0))
+        el.append(_text(PAD_L - 8, y, str(t), FS_TICK, anchor="end", fill="#444", baseline="central"))
+
+    for c in range(7):
+        x = _sx(c)
+        el.append(_line(x, PAD_T, x, PAD_T + PLOT_H, stroke="#e6e6e6", width=1.0))
+        el.append(_text(x, PAD_T + PLOT_H + 18, str(c), FS_TICK, anchor="middle", fill="#444"))
+
+    el.append(
+        f'<rect x="{PAD_L}" y="{PAD_T}" width="{PLOT_W}" height="{PLOT_H}" '
+        f'fill="none" stroke="#333" stroke-width="1.3"/>'
+    )
+
+    el.append(_text(PAD_L + PLOT_W / 2, HEIGHT - 10, "wt% C (stretched near 0)", FS_AXIS, weight="600"))
+    el.append(
+        f'<text x="20" y="{PAD_T + PLOT_H / 2:.1f}" font-size="{FS_AXIS}" font-weight="600" '
+        f'fill="#222" text-anchor="middle" transform="rotate(-90 20 {PAD_T + PLOT_H / 2:.1f})">Temperature (°C)</text>'
+    )
+
+    # --- Steel side -------------------------------------------------------
+    el.append(_polyline(LIQ_C, LIQ_T))          # liquidus
+    el.append(_polyline(SOL_C, SOL_T))          # solidus
+    el.append(_polyline(DELTA_C, DELTA_T))      # A4 (delta boundary)
+    el.append(_polyline(PERI_C, PERI_T))        # peritectic isotherm
+    el.append(_polyline(A3_C, A3_T))            # GS line (A3)
+    el.append(_polyline(ACM_C, ACM_T))          # SE line (Acm)
+    el.append(_polyline(ALPHA_C, ALPHA_T))      # ferrite solvus
+
+    # Eutectoid isotherm (727 °C), from the ferrite limit to the Fe3C line.
+    el.append(_line(_sx(C_FERRITE_MAX), _sy(T_EUT), _sx(C_CEM), _sy(T_EUT)))
+
+    # --- Cast-iron side ---------------------------------------------------
+    el.append(_line(_sx(2.14), _sy(T_EUTECTIC), _sx(C_CEM), _sy(T_EUTECTIC)))
+    el.append(_line(_sx(2.14), _sy(T_EUT), _sx(2.14), _sy(T_EUTECTIC), stroke="#737373", width=1.2, dash="5,4"))
+    el.append(_line(_sx(C_ECT), _sy(T_EUT), _sx(C_ECT), _sy(T_EUTECTIC), stroke="#737373", width=1.2, dash="5,4"))
+    el.append(_polyline(CEM_LIQ_C, CEM_LIQ_T, stroke="#737373", width=1.2, dash="5,4"))
+
+    # Vertical Fe3C line at 6.67 wt% C, from room temperature up.
+    el.append(_line(_sx(C_CEM), _sy(T_ROOM), _sx(C_CEM), _sy(CEM_LIQ_T[-1]), stroke="#333", width=2.0))
+    el.append(_text(_sx(C_CEM) - 8, _sy(1380), "Fe₃C", FS_TEMP_REF, anchor="end", weight="600", halo=True))
+    el.append(_text(_sx(C_CEM) - 8, _sy(1380) + 17, "6.67 %", FS_TEMP_REF, anchor="end", weight="600", halo=True))
+
+    # --- Temperature and point labels -------------------------------------
+    for txt, xd, t, anchor in [
+        ("1538 °C", 0.14, 1545, "start"),
+        ("912 °C", 0.12, 928, "start"),
+        ("727 °C", 6.72, 745, "end"),
+        ("1147 °C", 6.72, 1165, "end"),
+    ]:
+        el.append(_text(_sx_disp(xd), _sy(t), txt, FS_TEMP_REF, anchor=anchor, fill="#333", halo=True))
+
+    # --- Region labels ----------------------------------------------------
+    for txt, xd, t, size in [
+        ("L", 3.55, 1360, FS_REGION),
+        ("γ + L", 1.15, 1380, FS_REGION),
+        ("δ", 0.11, 1435, FS_TEMP_REF),
+        ("γ", 0.68, 1000, FS_REGION),
+        ("α + Fe₃C", 2.0, 270, FS_REGION),
+    ]:
+        el.append(_text(_sx_disp(xd), _sy(t), txt, size, anchor="middle", fill="#444", weight="600", halo=True))
+
+    return "\n".join(el)
+
+
+def diagram_svg(C0, T0, T, s):
+    """Build the phase diagram SVG, cooling path, and current tie line.
 
     Args:
-        ax: matplotlib Axes to draw on.
         C0: alloy composition (wt% C).
         T0: starting temperature (°C), the top of the cooling path.
         T: current temperature (°C).
         s: state dict from state(C0, T).
     """
-    solid = dict(color="0.25", lw=1.2)
-    dashed = dict(color="0.45", lw=0.9, ls="--")
+    dyn = [_static_diagram_body()]
 
-    # --- Steel side -------------------------------------------------------
-    ax.plot(xdisp(LIQ_C), LIQ_T, **solid)          # liquidus
-    ax.plot(xdisp(SOL_C), SOL_T, **solid)          # solidus
-    ax.plot(xdisp(DELTA_C), DELTA_T, **solid)      # A4 (delta boundary)
-    ax.plot(xdisp(PERI_C), PERI_T, **solid)        # peritectic isotherm
-    ax.plot(xdisp(A3_C), A3_T, **solid)            # GS line (A3)
-    ax.plot(xdisp(ACM_C), ACM_T, **solid)          # SE line (Acm)
-    ax.plot(xdisp(ALPHA_C), ALPHA_T, **solid)      # ferrite solvus
-
-    # Eutectoid isotherm (727 °C), from the ferrite limit to the Fe3C line.
-    ax.hlines(T_EUT, xdisp(C_FERRITE_MAX), xdisp(C_CEM), **solid)
-
-    # --- Cast-iron side ---------------------------------------------------
-    ax.hlines(T_EUTECTIC, xdisp(2.14), xdisp(C_CEM), **solid)
-    ax.plot([xdisp(2.14)] * 2, [T_EUT, T_EUTECTIC], **dashed)
-    ax.plot([xdisp(C_ECT)] * 2, [T_EUT, T_EUTECTIC], **dashed)
-    ax.plot(xdisp(CEM_LIQ_C), CEM_LIQ_T, **dashed)
-
-    # Vertical Fe3C line at 6.67 wt% C, from room temperature up.
-    ax.plot([xdisp(C_CEM)] * 2, [T_ROOM, CEM_LIQ_T[-1]],
-            color="0.25", lw=1.6)
-    ax.text(xdisp(C_CEM) - 0.1, 1350, "Fe₃C\n6.67 %", fontsize=7, ha="right")
-
-    # --- Temperature and point labels --------------------------------------
-    for txt, x, y, ha in [("1538 °C", 0.05, 1555, "left"),
-                          ("912 °C", 0.05, 935, "left"),
-                          ("727 °C", 6.6, 745, "right"),
-                          ("1147 °C", 6.6, 1165, "right")]:
-        ax.text(x, y, txt, fontsize=6, ha=ha)
-
-    # --- Region labels -----------------------------------------------------
-    for txt, x, y in [("L", 3.4, 1350), ("γ + L", 0.95, 1385),
-                      ("δ", 0.05, 1440), ("γ", 0.5, 1000),
-                      ("α + Fe₃C", 1.5, 250)]:
-        ax.text(x, y, txt, fontsize=7, color="0.35")
+    # Title showing current temperature
+    dyn.append(_text(PAD_L + PLOT_W / 2, 26, f"Fe-C diagram: T = {T:.0f} °C", FS_TITLE, weight="700"))
 
     # Dotted vertical line: the path the alloy follows as it cools.
-    ax.plot([xdisp(C0)] * 2, [T_ROOM, T0], color="tab:red", lw=1, ls=":")
+    x0 = _sx(C0)
+    dyn.append(_line(x0, _sy(T_ROOM), x0, _sy(T0), stroke="#d62728", width=1.8, dash="3,4"))
 
     # In a two-phase region, draw the tie line and mark its two ends.
     if s["tie"]:
         (nl, cl, _), (nr, cr, _) = s["tie"]
-        xl, xr = xdisp(cl), xdisp(cr)
-        ax.plot([xl, xr], [T, T], color="black", lw=1.5)
-        ax.plot([xl, xr], [T, T], "o", color="black", ms=5)
-        ax.text(xl, T + 40, disp(nl), fontsize=7, ha="center")
-        ax.text(xr, T + 40, disp(nr), fontsize=7, ha="center")
+        xl, xr = _sx(cl), _sx(cr)
+        yt = _sy(T)
+        dyn.append(_line(xl, yt, xr, yt, stroke="#111", width=2.2))
+        dyn.append(f'<circle cx="{xl:.1f}" cy="{yt:.1f}" r="4.5" fill="#111"/>')
+        dyn.append(f'<circle cx="{xr:.1f}" cy="{yt:.1f}" r="4.5" fill="#111"/>')
+
+        y_lbl = max(yt - 11, PAD_T + 18)
+        # Keep endpoint labels inside the plot box and clear of each other when narrow.
+        a_l = "start" if xl < PAD_L + 42 else "middle"
+        a_r = "end" if xr > PAD_L + PLOT_W - 42 else "middle"
+        if xr - xl < 75:
+            a_l, a_r = "end", "start"
+        dyn.append(_text(xl, y_lbl, disp(nl), FS_TIE, anchor=a_l, fill="#111", weight="600", halo=True))
+        dyn.append(_text(xr, y_lbl, disp(nr), FS_TIE, anchor=a_r, fill="#111", weight="600", halo=True))
 
     # The alloy's current point, drawn on top of everything else.
-    ax.plot(xdisp(C0), T, "o", color="tab:red", ms=7, zorder=5)
+    dyn.append(f'<circle cx="{x0:.1f}" cy="{_sy(T):.1f}" r="6.5" fill="#d62728" stroke="white" stroke-width="1.5"/>')
 
-    # --- Axes: ticks show true composition values at stretched positions ---
-    ax.set_xlim(0, float(xdisp(6.8)))
-    ax.set_ylim(0, 1600)
-    tick_c = np.arange(7)
-    ax.set_xticks(xdisp(tick_c))
-    ax.set_xticklabels([str(c) for c in tick_c])
-    ax.set_yticks(range(0, 1601, 200))
-    ax.set_xlabel("wt% C (stretched near 0)")
-    ax.set_ylabel("Temperature (°C)")
-    ax.set_title(f"Fe-C diagram: T = {T:.0f} °C", fontsize=10)
-    ax.grid(alpha=0.2)
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {DIAG_W} {HEIGHT}" '
+        f'style="width:100%;height:auto;display:block;font-family:{FONT_FAMILY};">\n'
+        + "\n".join(dyn)
+        + "\n</svg>"
+    )
 
-def draw_seesaw(ax, C0, s):
-    """Draw the lever-rule seesaw in inch units.
 
-    The axes must be set to (0, RIGHT_W) by (0, SEE_H), so one data unit
-    equals one inch and the circles are truly circular.
+def right_panel_svg(C0, s):
+    """Build the right-hand SVG: micrograph, color legend, and lever seesaw.
 
-    Each phase end carries a circle whose AREA is proportional to its mass
-    fraction (radius = r_max * sqrt(f)). The fill uses the phase color from
-    MICRO_COLORS. The beam pivots at C0.
+    Both figures share HEIGHT = 500 so they align to the same height on screen.
+    Each seesaw circle has AREA proportional to its mass fraction
+    (radius = R_MAX * sqrt(f)), and the beam pivots at C0.
 
     Args:
-        ax: matplotlib Axes in inch coordinates.
         C0: alloy composition (wt% C), used to place the pivot.
-        s: state dict from state(C0, T). If it has no tie line, a message is drawn.
+        s: state dict from state(C0, T).
     """
-    W, H = RIGHT_W, SEE_H
+    el = []
 
+    # --- Microstructure + Legend ------------------------------------------
+    el.append(_text(RIGHT_W / 2, 24, "Microstructure (schematic)", FS_TITLE - 1, weight="700"))
+
+    micro_key = tuple((name, round(float(f), 4)) for name, f in s["micro"])
+    b64 = _micro_png_b64(micro_key)
+    x_img, y_img, d_img = MICRO_CX - MICRO_R, MICRO_CY - MICRO_R, MICRO_R * 2
+    el.append(
+        f'<defs><clipPath id="micro-clip">'
+        f'<circle cx="{MICRO_CX}" cy="{MICRO_CY}" r="{MICRO_R}"/>'
+        f'</clipPath></defs>'
+    )
+    el.append(
+        f'<image x="{x_img}" y="{y_img}" width="{d_img}" height="{d_img}" '
+        f'href="data:image/png;base64,{b64}" clip-path="url(#micro-clip)"/>'
+    )
+    el.append(
+        f'<circle cx="{MICRO_CX}" cy="{MICRO_CY}" r="{MICRO_R}" fill="none" stroke="#222" stroke-width="1.5"/>'
+    )
+
+    # Color key stacked beside the circular micrograph.
+    legend_items = [
+        ("γ austenite", PHASE_HEX["austenite"]),
+        ("α ferrite", PHASE_HEX["ferrite"]),
+        ("Fe₃C", PHASE_HEX["cementite"]),
+    ]
+    for i, (label, hex_color) in enumerate(legend_items):
+        y = 56 + i * 38
+        el.append(f'<rect x="14" y="{y}" width="22" height="20" rx="2" fill="{hex_color}" stroke="#333" stroke-width="1"/>')
+        el.append(_text(44, y + 10, label, FS_LEGEND, anchor="start", fill="#222", baseline="central"))
+
+    # --- Lever-rule seesaw ------------------------------------------------
     # Single-phase region: no tie line, so no seesaw.
     if not s["tie"]:
-        ax.text(W / 2, H / 2, "Single phase: no lever rule needed",
-                ha="center", va="center", fontsize=8)
-        return
+        el.append(_text(RIGHT_W / 2, (SEESAW_TOP + HEIGHT) / 2, "Single phase: no lever rule needed", FS_SEESAW + 1, fill="#444"))
+    else:
+        (nl, cl, fl), (nr, cr, fr) = s["tie"]
 
-    (nl, cl, fl), (nr, cr, fr) = s["tie"]
+        # Arm lengths in composition units, scaled so the longer arm fits MAX_ARM_PX.
+        arm_l, arm_r = C0 - cl, cr - C0
+        scale = MAX_ARM_PX / max(arm_l, arm_r, 1e-9)
+        xp = RIGHT_W / 2
+        xl = xp - arm_l * scale
+        xr = xp + arm_r * scale
 
-    # Arm lengths in composition units.
-    arm_l, arm_r = C0 - cl, cr - C0
+        # Beam and fulcrum triangle.
+        el.append(
+            f'<line x1="{xl:.1f}" y1="{BEAM_Y}" x2="{xr:.1f}" y2="{BEAM_Y}" '
+            f'stroke="#444" stroke-width="6" stroke-linecap="round"/>'
+        )
+        el.append(
+            f'<polygon points="{xp:.1f},{BEAM_Y + 5} {xp - 10:.1f},{BEAM_Y + 23} {xp + 10:.1f},{BEAM_Y + 23}" fill="#444"/>'
+        )
 
-    # Layout in inches. The beam sits in the upper part of the panel.
-    beam_y = SEE_H * 0.6
-    max_arm_in = 1.1
-    r_max = 0.42
+        # One circle per phase resting on the beam (area proportional to fraction).
+        for x, name, f in ((xl, nl, fl), (xr, nr, fr)):
+            r = R_MAX * float(np.sqrt(f))
+            fill = PHASE_HEX.get(name, "#d9d9d9")
+            el.append(f'<circle cx="{x:.1f}" cy="{BEAM_Y - r - 3:.1f}" r="{r:.1f}" fill="{fill}" stroke="#333" stroke-width="1.2"/>')
+            y_lbl = BEAM_Y - 2 * r - 12
+            el.append(_text(x, y_lbl - 18, disp(name), FS_SEESAW, fill="#222"))
+            el.append(_text(x, y_lbl, f"{f:.1%}", FS_SEESAW, fill="#111", weight="700"))
 
-    # Scale composition arms to inches. The pivot sits at the horizontal center.
-    scale = max_arm_in / max(arm_l, arm_r, 1e-9)
-    xp = W / 2
-    xl = xp - arm_l * scale
-    xr = xp + arm_r * scale
+        # Arm labels at each arm's midpoint, kept clear of the center fulcrum.
+        xl_arm = min((xl + xp) / 2, xp - 44)
+        xr_arm = max((xp + xr) / 2, xp + 44)
+        for xa, arm in ((xl_arm, arm_l), (xr_arm, arm_r)):
+            el.append(_text(xa, BEAM_Y + 46, "arm", FS_ARM, fill="#444"))
+            el.append(_text(xa, BEAM_Y + 64, f"{arm:.3f}", FS_ARM, fill="#222", weight="600"))
 
-    # Beam and fulcrum.
-    ax.plot([xl, xr], [beam_y, beam_y], color="0.3", lw=4,
-            solid_capstyle="round")
-    ax.plot([xp], [beam_y - 0.15], marker="^", ms=10, color="0.3")
+        # Rule reminder at the bottom of the panel.
+        el.append(_text(RIGHT_W / 2, HEIGHT - 12, "mass fraction × its arm must match on both sides", FS_NOTE, fill="#444"))
 
-    # One circle per phase, resting on the beam. Area is proportional to
-    # the fraction. The fill uses the micrograph colors.
-    for x, name, f in ((xl, nl, fl), (xr, nr, fr)):
-        r = r_max * np.sqrt(f)
-        fill = MICRO_COLORS.get(name, (0.85, 0.85, 0.85))
-        ax.add_patch(Circle((x, beam_y + r), r, fc=fill, ec="0.3", lw=1))
-        ax.text(x, beam_y + 2 * r + 0.06, f"{disp(name)}\n{f:.1%}",
-                ha="center", va="bottom", fontsize=7)
-
-    # Arm labels at the midpoint of each arm, just below the beam.
-    ax.text((xl + xp) / 2, beam_y - 0.4, f"arm\n{arm_l:.3f}",
-            ha="center", va="center", fontsize=7)
-    ax.text((xp + xr) / 2, beam_y - 0.4, f"arm\n{arm_r:.3f}",
-            ha="center", va="center", fontsize=7)
-
-    # Rule reminder at the bottom of the panel.
-    ax.text(W / 2, 0.08, "mass fraction × its arm must match on both sides",
-            ha="center", va="bottom", fontsize=6.5)
-
-def draw_legend(ax):
-    """Draw a color key in inch units beside the micrograph.
-
-    The axes must be sized to (RIGHT_W, MICRO_D) inches so data units are inches.
-
-    Args:
-        ax: matplotlib Axes covering the full width of the right panel.
-    """
-    ax.set_xlim(0, RIGHT_W)
-    ax.set_ylim(0, MICRO_D)
-    ax.set_axis_off()
-
-    items = [("γ austenite", AUSTENITE_RGB),
-             ("α ferrite", FERRITE_RGB),
-             ("Fe₃C", CEMENTITE_RGB)]
-
-    # Stack the swatches from the top down. Each swatch is a small square
-    # with a label to its right.
-    for i, (label, color) in enumerate(items):
-        y = MICRO_D - 0.25 - i * 0.30
-        ax.add_patch(Rectangle((0.05, y), 0.22, 0.20,
-                               fc=color, ec="0.2", lw=0.6))
-        ax.text(0.35, y + 0.10, label, va="center", fontsize=7)
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {RIGHT_W} {HEIGHT}" '
+        f'style="width:100%;height:auto;display:block;font-family:{FONT_FAMILY};">\n'
+        + "\n".join(el)
+        + "\n</svg>"
+    )
 
 
-def draw_right_panel(C0, s):
-    """Build the right-hand figure: micrograph, legend, and seesaw.
-
-    The figure is DIAG_H inches tall, the same as the phase diagram, so the
-    two images stack to the same height on screen.
-
-    Args:
-        C0: alloy composition (wt% C), passed to the seesaw.
-        s: state dict from state(C0, T).
-
-    Returns:
-        A matplotlib Figure. The caller shows it and closes it.
-    """
-    fig = plt.figure(figsize=(RIGHT_W, DIAG_H), dpi=DPI)
-
-    # Micrograph axes: a square MICRO_D inches wide, centered horizontally,
-    # sitting just above the seesaw area and below the title strip.
-    micro_bottom = SEE_H / DIAG_H
-    micro_left = (RIGHT_W - MICRO_D) / 2 / RIGHT_W
-    micro_ax = fig.add_axes([micro_left, micro_bottom,
-                             MICRO_D / RIGHT_W, MICRO_D / DIAG_H])
-    micro_ax.imshow(micro_image(s["micro"]), extent=(-1, 1, -1, 1),
-                    origin="lower")
-    micro_ax.add_patch(Circle((0, 0), 1, fill=False, lw=0.9, ec="0.1"))
-    micro_ax.set_xlim(-1.05, 1.05)
-    micro_ax.set_ylim(-1.05, 1.05)
-    micro_ax.set_axis_off()
-    micro_ax.set_title("Microstructure (schematic)", fontsize=7, pad=2)
-
-    # Legend axes: same height as the micrograph, spanning the full width.
-    # The swatches are drawn in the empty space beside the circle.
-    legend_ax = fig.add_axes([0, SEE_H / DIAG_H, 1, MICRO_D / DIAG_H])
-    draw_legend(legend_ax)
-
-    # Seesaw axes: fills the bottom SEE_H inches. Data units are inches.
-    see_ax = fig.add_axes([0, 0, 1, SEE_H / DIAG_H])
-    see_ax.set_xlim(0, RIGHT_W)
-    see_ax.set_ylim(0, SEE_H)
-    draw_seesaw(see_ax, C0, s)
-
-    return fig
-
-
-def show(placeholder, fig):
-    """Save a figure to an in-memory PNG and display it at its native size.
-
-    Showing at a fixed pixel width keeps the displayed heights exact. Streamlit
-    would otherwise rescale each image to its column width.
-
-    Args:
-        placeholder: st.empty() slot to fill.
-        fig: matplotlib Figure to show. It is closed after saving.
-    """
-    buf = BytesIO()
-    width_px = int(round(fig.get_figwidth() * DPI))
-    fig.savefig(buf, format="png", dpi=DPI)
-    plt.close(fig)
-    buf.seek(0)
-    placeholder.image(buf, width=width_px)
+def show_svg(placeholder, svg, width_px):
+    """Display an SVG inside a placeholder as a self-contained data-URI image."""
+    b64 = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    placeholder.markdown(
+        f'<img src="data:image/svg+xml;base64,{b64}" '
+        f'style="width:100%;max-width:{width_px}px;height:auto;display:block;">',
+        unsafe_allow_html=True,
+    )
 
 
 def readout(T, C0, s):
-    """Build the Markdown text shown under the panels.
+    """Build the header and 4 side-by-side Markdown sections shown under the panels.
 
     Lists the phase fractions, the tie-line compositions, a torque check, and
     (if different) the microconstituent fractions.
@@ -681,39 +789,49 @@ def readout(T, C0, s):
         s: state dict from state(C0, T).
 
     Returns:
-        A Markdown string for st.markdown.
+        (header_md, [col1_md, col2_md, col3_md, col4_md]) for st.markdown.
     """
-    lines = [f"**T = {T:.0f} °C · {s['label']}**", "",
-             "**Phase fractions (lever rule)**"]
+    header = f"**T = {T:.0f} °C · {s['label']}**"
 
-    # Skip fractions that round to zero (below 0.05%).
+    # 1. Phase fractions (lever rule)
+    frac_lines = ["**Phase fractions (lever rule)**"]
     for name, f in s["mix"]:
         if f > 0.0005:
-            lines.append(f"- {disp(name)}: **{f:.1%}**")
+            frac_lines.append(f"- {disp(name)}: **{f:.1%}**")
 
+    # 2. Phase compositions & 3. Balance check (only when a tie line exists)
     if s["tie"]:
-        lines += ["", "**Phase compositions (tie-line ends)**"]
+        comp_lines = ["**Phase compositions (tie-line ends)**"]
         for name, c, _ in s["tie"]:
-            lines.append(f"- {disp(name)}: {c:.4f} wt% C")
+            comp_lines.append(f"- {disp(name)}: {c:.4f} wt% C")
 
-        # Torque check: fraction × arm on each side should match.
         (nl, cl, fl), (nr, cr, fr) = s["tie"]
-        lines += [
-            "",
+        bal_lines = [
             "**Balance check (torques about C₀)**",
             f"- Left: {fl:.3f} × ({C0:.3f} − {cl:.4f}) = {fl * (C0 - cl):.5f}",
             f"- Right: {fr:.3f} × ({cr:.4f} − {C0:.3f}) = {fr * (cr - C0):.5f}",
         ]
+    else:
+        comp_lines = []
+        bal_lines = []
 
-    # Show the microconstituents only when they differ from the phase mix,
-    # such as pearlite below 727 °C.
+    # 4. Microconstituents (only when they differ from the phase mix, e.g. pearlite)
     if s["micro"] != s["mix"]:
-        lines += ["", "**Microconstituents (schematic)**"]
+        micro_lines = ["**Microconstituents (schematic)**"]
         for name, f in s["micro"]:
             if f > 0.0005:
-                lines.append(f"- {disp(name)}: {f:.1%}")
+                micro_lines.append(f"- {disp(name)}: {f:.1%}")
+    else:
+        micro_lines = []
 
-    return "\n".join(lines)
+    cols = [
+        "\n".join(frac_lines),
+        "\n".join(comp_lines),
+        "\n".join(bal_lines),
+        "\n".join(micro_lines),
+    ]
+    return header, cols
+
 
 # ---------------------------------------------------------------------------
 # README tab: reads README.md from the same folder as this script
@@ -721,11 +839,12 @@ def readout(T, C0, s):
 README_PATH = Path(__file__).with_name("README.md")
 
 
+@st.cache_data(max_entries=1)
 def load_readme():
     """Return the README text, or a short note if the file is missing."""
     if README_PATH.exists():
         return README_PATH.read_text(encoding="utf-8")
-    return ("README.md was not found next to fe_c_cooling.py. "
+    return ("README.md was not found next to fe_c_cooling_v3.py. "
             "Put it in the same folder and reload the page.")
 
 
@@ -737,20 +856,61 @@ st.caption("Approximate Fe-Fe₃C diagram for teaching. Boundaries are "
            "hand-placed, not exact. Composition runs from pure iron up to "
            "the steel/cast-iron boundary (2.14 wt% C).")
 
-# Animation controls: where the cooling path starts, and how it steps.
+# Animation controls: initial temperature, step/delay, and playback buttons.
 st.sidebar.header("Cooling animation")
-T0 = st.sidebar.slider("Initial temperature T₀ (°C)", 800, 1390, 1000, 5)
+T0 = st.sidebar.slider("Initial temperature T₀ (°C)", 800, 1390, 1300, 5)
 step = st.sidebar.select_slider("Cooling step (°C per frame)",
-                                options=[5, 10, 20, 40], value=20)
+                                options=[5, 10, 20, 40], value=5)
 delay = st.sidebar.slider("Frame delay (s)", 0.0, 0.3, 0.05, 0.01)
 
-# Composition of the alloy, shared by the animation and the static view.
-st.sidebar.header("Alloy")
-C0 = st.sidebar.slider("Composition C₀ (wt% C)", 0.00, 2.14, 0.40, 0.01)
+if "T_NOW" not in st.session_state:
+    st.session_state.T_NOW = T0
+if "playing" not in st.session_state:
+    st.session_state.playing = False
 
-# Static view: the temperature shown when Play is not pressed.
+# Apply any pending animation step before the T_NOW slider is instantiated.
+if st.session_state.pop("advance", False) and st.session_state.playing:
+    if st.session_state.T_NOW > T_ROOM:
+        st.session_state.T_NOW = max(int(T_ROOM), st.session_state.T_NOW - step)
+    else:
+        st.session_state.playing = False
+
+
+def _toggle_play(t0):
+    st.session_state.playing = not st.session_state.playing
+    if st.session_state.playing and st.session_state.T_NOW <= T_ROOM:
+        st.session_state.T_NOW = t0
+
+
+def _step_back(t0, s):
+    st.session_state.playing = False
+    st.session_state.T_NOW = min(t0, st.session_state.T_NOW + s)
+
+
+def _step_forward(s):
+    st.session_state.playing = False
+    st.session_state.T_NOW = max(int(T_ROOM), st.session_state.T_NOW - s)
+
+
+def _restart(t0):
+    st.session_state.playing = False
+    st.session_state.T_NOW = t0
+
+
+b_play, b_back, b_fwd, b_rst = st.sidebar.columns(4)
+b_play.button("⏸" if st.session_state.playing else "▶", help="Play / Pause",
+              on_click=_toggle_play, args=(T0,))
+b_back.button("⏮", help=f"Step back (+{step} °C)",
+              on_click=_step_back, args=(T0, step))
+b_fwd.button("⏭", help=f"Step forward (-{step} °C)",
+             on_click=_step_forward, args=(step,))
+b_rst.button("↺", help="Restart at T₀", on_click=_restart, args=(T0,))
+
+# Static view: the composition and temperature shown when Play is not pressed.
 st.sidebar.header("Current view")
-T_NOW = st.sidebar.slider("Current temp (°C)", int(T_ROOM), 1390, 1000, 5)
+C0 = st.sidebar.slider("Current composition C₀ (wt% C)", 0.00, 2.14, 1.50, 0.01)
+T_NOW = st.sidebar.slider("Current temp (°C)", int(T_ROOM), 1390, step=5, key="T_NOW")
+st.sidebar.info(f"**Current state:** {state(C0, T_NOW)['label']}")
 
 tab_app, tab_readme = st.tabs(["Explorer", "README"])
 
@@ -758,51 +918,35 @@ with tab_readme:
     st.markdown(load_readme())
 
 with tab_app:
-    # Button returns True only on the run where it was clicked.
-    play = st.button(f"▶ Play cooling from {T0} °C to {T_ROOM:.0f} °C")
-
     # Two columns: the diagram on the left, the micrograph, legend, and
     # seesaw on the right. st.empty() creates placeholders that render()
     # overwrites.
-    left, right = st.columns([1.3, 1])
+    left, right = st.columns([DIAG_W, RIGHT_W])
     ph_diag = left.empty()
     ph_right = right.empty()
-    ph_text = st.empty()
+    ph_header = st.empty()
+    ph_cols = [c.empty() for c in st.columns(4)]
 
     def render(T):
-        """Draw the diagram, the right-hand panel, and the readout for temperature T.
-
-        Each figure is created, shown in its placeholder, and then closed.
-        Closing frees memory, which matters during an animation with many frames.
-        """
+        """Draw the diagram, the right-hand panel, and the readout for temperature T."""
         s = state(C0, T)
-
-        # Panel 1: phase diagram.
-        fig, ax = plt.subplots(figsize=(DIAG_W, DIAG_H), dpi=DPI)
-        draw_diagram(ax, C0, T0, T, s)
-        fig.tight_layout()
-        show(ph_diag, fig)
-
-        # Panels 2 and 3: micrograph and legend above, seesaw below.
-        show(ph_right, draw_right_panel(C0, s))
-
-        # Text readout below the panels.
-        ph_text.markdown(readout(T, C0, s))
+        show_svg(ph_diag, diagram_svg(C0, T0, T, s), DIAG_W)
+        show_svg(ph_right, right_panel_svg(C0, s), RIGHT_W)
+        header, cols = readout(T, C0, s)
+        ph_header.markdown(header)
+        for ph, text in zip(ph_cols, cols):
+            ph.markdown(text)
 
     # -----------------------------------------------------------------------
-    # Main flow: animate on button press, otherwise show the current temperature.
+    # Main flow: render current temperature, and advance if playing.
     # -----------------------------------------------------------------------
-    if play:
-        # Build the temperature list from T0 down to room temperature, in
-        # steps of `step`. The final frame is T_ROOM, so the animation always
-        # ends there.
-        frames = list(np.arange(T0, T_ROOM, -step)) + [T_ROOM]
-        for T in frames:
-            render(float(T))
-            time.sleep(delay)  # pause so the eye can follow each frame
-    else:
-        # No animation: show the state at the temperature chosen on the slider.
-        render(float(T_NOW))
-    # No animation: show the state at the temperature chosen on the slider.
     render(float(T_NOW))
-#-----End-of-file----------------------
+
+    if st.session_state.playing:
+        if T_NOW > T_ROOM:
+            time.sleep(delay)
+            st.session_state.advance = True
+            st.rerun()
+        else:
+            st.session_state.playing = False
+            st.rerun()
